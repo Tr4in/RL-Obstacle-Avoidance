@@ -1,81 +1,207 @@
-import unreal
+'''
+Implementation inspired by:
+
+1. https://www.youtube.com/watch?v=H9uCYnG3LlE, last visited: 26.01.2022
+2. https://github.com/xie9187/Monocular-Obstacle-Avoidance, last visited: 26.01.2022
+
+'''
+
+from collections import deque
+from numpy.core.fromnumeric import size
+import torch
+import torch.optim as optim
 from environment import Environment
-from agent import Agent
+from agent import Agent, DeepQNetwork
+import win32pipe, win32file
+import numpy as np
+import time
+from matplotlib import pyplot as plt
+from experience_replay_buffer import PrioritizedExperienceReplayBuffer
+from ue_communicator import UECommunicator
 
-#img_path = 'Game\Screenshots\game_scene.png'
-#screenshot = unreal.AutomationLibrary()
-#agentCamera = unreal.GameplayStatics.get_all_actors_of_class_with_tag(unreal.EditorLevelLibrary.get_editor_world(), unreal.CameraActor, 'agentCamera')[0]
-#unreal.log(agentCamera)
-#screenshot.take_high_res_screenshot(224, 224, img_path, None)
+MODE = 0
+TRAINED_MODEL_PATH = './trained_q_model/q_model_episode_1000.pth'
+PLOT_REWARDS_PATH = './plots/plot_episode_{}'
+NUM_EPISODES = 1000
+NUM_TEST_EPISODES = 2000
+NUM_TIMESTEPS = 1500
+NUM_ACTIONS = 6
+REPLAY_BUFFER_SIZE = 10000
+BATCH_SIZE = 8
+CONSECUTIVE_IMAGES = 4
+OSERVATION_EPISODES = 10
+UPDATE_TARGET = 50
+SAVE_MODELS = 50
+EPSILON_DEC_TIMESTEPS = 20000
+NUM_LASER = 9
 
-import threading
+REWARDS = []
+AVERAGE_REWARDS = []
+GAMMA = 0.995
+LEARNING_RATE = 0.00005
+EPSILON = 0.6
+EPSILON_END = 0.001
+EPSILON_DEC = (EPSILON - EPSILON_END) / EPSILON_DEC_TIMESTEPS
+IMAGE_SHAPE = (192, 320)
+AVERAGE_NUM = 10
+ALPHA = 0.7
+BETA = 0.5
+BETA_INCREMENT = (1 - BETA) / EPSILON_DEC_TIMESTEPS 
 
-n_laser = 24
-environment = Environment(n_laser)
-unreal_agent = unreal.GameplayStatics.get_all_actors_with_tag(unreal.EditorLevelLibrary.get_game_world(), 'agent')[0]
-speed = 100
-agent = Agent(unreal_agent, speed, 0.99, 0.75, 0.2, n_laser, 10, 200, 3, 3)
-NUM_EPISODES = 10
-NUM_ITERATIONS = 100
-
-
-def actor_hit(self_actor, other_actor, normal_impulse, hit):
-    unreal.log('Hit')
-
-actor_hit_signature = unreal.ActorHitSignature()
-actor_hit_signature.add_callable(actor_hit)
-
-unreal_agent.set_editor_property('on_actor_hit', actor_hit_signature)
-
-
-def start_training():
-    for iteration in range(NUM_ITERATIONS):
-        create_replay_memory()
-        agent.compute_learning_target()
-        agent.optimize_q_network()
-
-        if iteration == 1500:
-            agent.swap_models()
-    
-    #for episode in range(NUM_EPISODES):
-    #    action = agent.get_next_action(observation)
-    #    reward, next_state, done = environment.step(agent, action, False)
-    #    agent.learn()
+PRIORITIZED_REPLAY_BUFFER = PrioritizedExperienceReplayBuffer(REPLAY_BUFFER_SIZE, BATCH_SIZE, ALPHA, BETA, BETA_INCREMENT)
 
 
-def create_replay_memory():
-    state = environment.reset()
-    agent.experience_replay_counter = 0
+def start_training(start_episode = None):
+    start_episode = 0 if start_episode is None else start_episode
+    ue_communicator.wait_for_environment_loading()
 
-    for episode in range(NUM_EPISODES):
+    for episode in range(start_episode + 1, NUM_EPISODES + 1):
+        print('Episode {}'.format(episode))
+
         done = False
-        unreal.log('Replay Episode {}'.format(episode))
-        while not done and agent.experience_replay_counter < agent.experience_memory_size: # export in one agent function
-            action = agent.get_next_action(state)
-            reward, next_state, done = environment.step(agent.unreal_agent, action)
-            #unreal.log(next_state)
-            agent.store_transition(state, action, reward, next_state)
-            state = next_state
+        observation = environment.reset()
+        total_reward = 0
+        step = 0
+
+        while not done and step < NUM_TIMESTEPS:
+            start = time.time()
+
+            if episode <= OSERVATION_EPISODES:
+                action = np.random.choice(NUM_ACTIONS)
+            else:
+                action = agent.get_next_action(observation, True)
+
+            reward, next_observation, done = environment.step(action)
+
+            PRIORITIZED_REPLAY_BUFFER.add_experience((observation, next_observation, action, reward, done))
+
+            observation = next_observation
+            total_reward += reward
+            step = step + 1
+
+            if episode > OSERVATION_EPISODES: 
+                agent.optimize_q_network(PRIORITIZED_REPLAY_BUFFER, episode)
+                agent.reduce_epsilon()
+
+            end = time.time()
+
+            diff = end - start
+            print('Step-Time: {}'.format(diff))
+        
+        REWARDS.append([episode, total_reward])
+        average_reward = (sum([reward for _, reward in REWARDS[-AVERAGE_NUM:]]) / AVERAGE_NUM) if len(REWARDS) >= AVERAGE_NUM else (sum([reward for _, reward in REWARDS]) / max(1, len(REWARDS)))
+
+        AVERAGE_REWARDS.append([episode, average_reward])
+        show_and_save_plot(episode)
+
+        if episode % SAVE_MODELS == 0:
+            save_trained_model(episode)
+            
+        if episode % UPDATE_TARGET == 0:
+            agent.update_target()
+    
+    save_trained_model(NUM_EPISODES)
+    show_plot()
 
 
-threading.Thread(target = start_training).start()
+def test_model():
+    for episode in range(1, NUM_TEST_EPISODES + 1):
+        print('Test Episode {}'.format(episode))
 
-#speed = 100
-#agent2 = unreal.GameplayStatics.get_all_actors_with_tag(unreal.EditorLevelLibrary.get_game_world(), 'agent')[0]
-#camera = unreal.GameplayStatics.get_all_actors_of_class(unreal.EditorLevelLibrary.get_game_world(), unreal.SceneCapture2D)[0]
-#unreal.log(camera.get_editor_property('capture_component2d').get_editor_property('texture_target'))
+        done = False
+        observation = environment.reset()
+        total_reward = 0
+        step = 0
 
-#n_laser_beam = 20
-#agent = Agent(0.99, 0.75, 0.2, n_laser_beam, 255, 3)
-#agent.learn()
+        while not done and step < NUM_TIMESTEPS:
+            action = agent.get_next_action(observation, False)
+            reward, next_observation, done = environment.step(action)
+            observation = next_observation
+            total_reward += reward
+            step = step + 1
+        
+        AVERAGE_REWARDS.append([episode, total_reward])
+     
 
-#environment = Environment()
-#environment.step(agent, 1)
+def load_models_and_last_episode(model_path):
+    checkpoint = torch.load(model_path)
+    
+    main_model = DeepQNetwork(LEARNING_RATE, NUM_ACTIONS)
+    main_model.load_state_dict(checkpoint['main_state_dict'])
+    main_loss = checkpoint['main_loss']
+    main_optimizer = optim.SGD(main_model.parameters(), lr=LEARNING_RATE)
+    main_optimizer.load_state_dict(checkpoint['main_optimizer_state_dict'])
+    main_model.set_optimizer(main_optimizer)
+    main_model.set_loss(main_loss)
 
-#renderTarget = camera.get_editor_property('capture_component2d').get_editor_property('texture_target')
-#renderTarget.export_to_disk(r'C:\Users\Bushw\OneDrive\Dokumente\Unreal Projects\DepthEstimation\Saved\Screenshots\Windows\Game\Screenshots\game', unreal.ImageWriteOptions(unreal.DesiredImageFormat.PNG, async_= False))
+    target_model = DeepQNetwork(LEARNING_RATE, NUM_ACTIONS)
+    target_model.load_state_dict(checkpoint['target_state_dict'])
+    target_loss = checkpoint['target_loss']
+    target_optimizer = optim.SGD(target_model.parameters(), lr=LEARNING_RATE)
+    target_optimizer.load_state_dict(checkpoint['target_optimizer_state_dict'])
+    target_model.set_optimizer(target_optimizer)
+    target_model.set_loss(target_loss)
 
+    episode = checkpoint['epoch']
 
-#agent.set_actor_location(agent.get_actor_location() + agent.get_actor_forward_vector() * speed, True, True)
+    return main_model, target_model, episode
 
-#unreal.log(agent.get_actor_forward_vector())
+def save_trained_model(episode):
+    agent.save_model(episode)
+
+def show_plot():
+    plt.ion()
+    plt.show()
+    plt.figure(num='Episodes and average rewards of the previous 10 episodes')
+    plt.title('Episodes and Average-Rewards') 
+    plt.xlabel('Episodes') 
+    plt.ylabel('Average-Reward Previous 10 Episodes')
+
+    plt.plot(*zip(*AVERAGE_REWARDS), c='black')
+    plt.draw()
+    plt.pause(0.001)
+
+def show_and_save_plot(episode):
+    show_plot()
+    plt.savefig(PLOT_REWARDS_PATH.format(episode))
+    #plt.clf()
+'''
+def save_plot(episode):
+    plt.figure(num='Episodes and average rewards of the previous 10 episodes')
+    plt.title('Episodes and Average-Reward') 
+    plt.xlabel('Episodes') 
+    plt.ylabel('Average-Reward Previous 10 Episodes') 
+    plt.plot(*zip(*AVERAGE_REWARDS), c='black')
+    plt.savefig(PLOT_REWARDS_PATH.format(episode))
+'''
+
+pipe = win32pipe.CreateNamedPipe(
+    r'\\.\pipe\ABC',
+    win32pipe.PIPE_ACCESS_DUPLEX,
+    win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT,
+    win32pipe.PIPE_UNLIMITED_INSTANCES, 65536, 65536,
+    5000,
+    None)
+try:
+    print('Waiting For Unreal Engine Agent')
+    win32pipe.ConnectNamedPipe(pipe, None)
+    print('Got Agent')
+
+    ue_communicator = UECommunicator(pipe)
+    environment = Environment(ue_communicator, CONSECUTIVE_IMAGES, NUM_TIMESTEPS, NUM_LASER)
+
+    if MODE == 0:
+        agent = Agent(GAMMA, EPSILON, LEARNING_RATE, IMAGE_SHAPE, REPLAY_BUFFER_SIZE, BATCH_SIZE, NUM_ACTIONS, EPSILON_END, EPSILON_DEC)
+        start_training()
+    elif MODE == 1:
+        main_network, target_network, episode = load_models_and_last_episode(TRAINED_MODEL_PATH)
+        agent = Agent(GAMMA, EPSILON - ((episode - OSERVATION_EPISODES) * EPSILON_DEC), LEARNING_RATE, IMAGE_SHAPE, REPLAY_BUFFER_SIZE, BATCH_SIZE, NUM_ACTIONS, EPSILON_END, EPSILON_DEC, target_network, main_network)
+        start_training(episode)
+    elif MODE == 2:
+        main_network, target_network, _ = load_models_and_last_episode(TRAINED_MODEL_PATH)
+        agent = Agent(GAMMA, EPSILON, LEARNING_RATE, IMAGE_SHAPE, REPLAY_BUFFER_SIZE, BATCH_SIZE, NUM_ACTIONS, EPSILON_END, EPSILON_DEC, main_network, target_network)
+        test_model()
+
+    print('finished now')
+finally:
+    win32file.CloseHandle(pipe)

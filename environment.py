@@ -1,79 +1,120 @@
-import unreal
-import torch
+'''
+Implementation inspired by:
+
+https://github.com/xie9187/Monocular-Obstacle-Avoidance, last visited: 26.01.2022
+
+'''
+
+
+from collections import deque
 import numpy as np
 import os
-import matplotlib.pyplot as plt
-import torchvision.transforms as transforms
-from PIL import Image, ImageDraw
-from agent import Agent
-
-FAST_DEPTH_MODEL_PATH = os.path.dirname(os.path.realpath(__file__)) + '\\results\mobilenet-nnconv5dw-skipadd-pruned.pth.tar'
-SCREENSHOT_SAVE_LOCATION = r'C:\Users\Bushw\OneDrive\Dokumente\Unreal Projects\DepthEstimation\Saved\Screenshots\Windows\Game\Screenshots\game'
-
-
-def colored_depthmap(depth, d_min=None, d_max=None):
-    if d_min is None:
-        d_min = np.min(depth)
-    if d_max is None:
-        d_max = np.max(depth)
-    depth_relative = (depth - d_min) / (d_max - d_min)
-    cmap = plt.cm.viridis
-    return 255 * cmap(depth_relative)[:,:,:3] # H, W, C
-
-
-def save_image(img_merge, filename):
-    img_merge = Image.fromarray(img_merge.astype('uint8'))
-    img_merge.save(filename)
-
-
+from pydnet_network import Pydnet
+import tensorflow as tf
+from PIL import Image
+import cv2
 
 class Environment:
-    def __init__(self, laser_lines):
-        self.camera = unreal.GameplayStatics.get_all_actors_of_class(unreal.EditorLevelLibrary.get_game_world(), unreal.SceneCapture2D)[0]
-        self.model_path = FAST_DEPTH_MODEL_PATH
-        self.laser_lines = laser_lines
-        assert os.path.isfile(self.model_path), \
-        "=> no model found at '{}'".format(self.model_path)
+    def __init__(self, ue_communicator, consecutive_images, time_steps, num_laser):
+        self.__load_pydnet_model()
+        self.counter = 1
+        self.ue_communicator = ue_communicator
+        self.consequtive_images = consecutive_images
+        self.image_buffer = deque(maxlen = consecutive_images)
+        self.time_steps = time_steps
+        self.num_laser = num_laser
 
-        checkpoint = torch.load(self.model_path)
-        
-        if type(checkpoint) is dict:
-            self.model = checkpoint['model']
-            #unreal.log(model)
+    def __load_pydnet_model(self):
+        network_params = {"height": 192, "width": 320, "is_training": False}
 
-    def step(self, unreal_agent, action):        
-        return self.get_observation()
+        pydnet_path = 'ckpt/pydnet'
+
+        model = Pydnet(network_params)
+        self.__tensor_image = tf.placeholder(tf.float32, shape=(192, 320, 3))
+        batch_img = tf.expand_dims(self.__tensor_image, 0)
+        self.__tensor_depth = model.forward(batch_img)
+        self.__tensor_depth = tf.nn.relu(self.__tensor_depth)
+
+        # restore graph
+        saver = tf.train.Saver()
+        self.sess = tf.Session()
+        self.sess.run(tf.global_variables_initializer())
+        saver.restore(self.sess, pydnet_path)
+
+    def step(self, action):
+        self.ue_communicator.execute_action_on_unreal_agent(action)
+        collision_happend, torque, steering, laser_distances = self.ue_communicator.get_data(self.num_laser)
+
+        print('Laser Distances: {}'.format(laser_distances))
+        print('Collision: {}'.format(collision_happend))
+        print('Steering: {}'.format(steering))
+        print('Torque: {}'.format(torque))
+        done = False
+
+        distance_smaller_than_threshold_list = []
+
+        for i in range(int(self.num_laser / 2)):
+            distance_smaller_than_threshold_list.append(laser_distances[i] < 6)
+            distance_smaller_than_threshold_list.append(laser_distances[self.num_laser -  1 - i] < 6)
+
+        #print(distance_smaller_than_threshold_list)
+
+        if collision_happend or any(distance_smaller_than_threshold_list) or laser_distances[int(self.num_laser / 2)] < 10:
+            reward = -10
+            done = True
+            #print('Collision')
+        else:
+            reward = ((torque / 20) * np.cos(np.deg2rad(steering)) - 0.36) / 20
+
+        print('Reward {}'.format(reward))
+
+        next_state = np.zeros((4,192,320))
+        if not done:
+            filename = self.ue_communicator.request_next_filename()
+            predicted_depth_image = self.get_normalized_predicted_depth_image(filename)
+            self.save_predicted_depth_image_to_buffer(predicted_depth_image)
+            next_state = self.get_state()
         
-        #img_merge = np.hstack([depth_pred_col])
-        #save_image(img_merge, r'C:\Users\Bushw\OneDrive\Dokumente\Unreal Projects\DepthEstimation\Saved\Screenshots\Windows\Game\Screenshots\game_scene_pred.png')
+        return reward, next_state, done
 
     def reset(self):
-        return self.get_state()
+        self.ue_communicator.reset_environment()
+        self.clear_image_buffer()
 
-    def take_screenshot(self):
-        renderTarget = self.camera.get_editor_property('capture_component2d').get_editor_property('texture_target')
-        renderTarget.export_to_disk(SCREENSHOT_SAVE_LOCATION, unreal.ImageWriteOptions(unreal.DesiredImageFormat.PNG, async_= False))
+        filename = self.ue_communicator.request_next_filename()
+        pred_depth_image = self.get_normalized_predicted_depth_image(filename)
+        
+        for _ in range(self.consequtive_images):
+            self.save_predicted_depth_image_to_buffer(pred_depth_image)
+
+        return self.get_state()
+        
+    def save_predicted_depth_image_to_buffer(self, predicted_depth_image):
+        self.image_buffer.appendleft(predicted_depth_image) 
+
+    def clear_image_buffer(self):
+        self.image_buffer.clear()
+    
+    def get_normalized_predicted_depth_image(self, filename):
+        img = np.array(Image.open(filename + '.png').convert('RGB')) / 255.0
+
+        depth_image = self.sess.run(self.__tensor_depth, feed_dict={self.__tensor_image: img}).squeeze(axis = (0, 3))
+
+        squeezed_depth_image = np.squeeze(depth_image)
+        min_depth = squeezed_depth_image.min()
+        max_depth = squeezed_depth_image.max()
+        depth_image = (depth_image - min_depth) / (max_depth - min_depth)
+
+        os.remove(filename + '.png')
+
+        self.__show_depth_image(depth_image)
+        return depth_image
+
+
+    def __show_depth_image(self, depth_image):
+        cv2.imshow('Depth Vision', depth_image)
+        cv2.waitKey(1)
 
     def get_state(self):
-        self.take_screenshot()
-        img = Image.open(SCREENSHOT_SAVE_LOCATION + '.png').convert('RGB')
-        pil_to_tensor = transforms.ToTensor()(img).unsqueeze_(0)
-        width, height = img.size
-
-        self.model.eval()
-        with torch.no_grad():
-            pred = self.model(pil_to_tensor.cuda())
-
-        #unreal.log(pred)
-        depth_pred_cpu = np.squeeze(pred.data.cpu().numpy())
-
-        d_min = np.min(depth_pred_cpu)
-        d_max = np.max(depth_pred_cpu)
-        depth_pred_col = colored_depthmap(depth_pred_cpu, d_min, d_max)
-
-        return np.array(depth_pred_col[1:224:28,124], dtype = np.float32).flatten()
-        
-
-    def get_observation(self):
-        reward = 1
-        return (reward, self.get_state(), False)
+        state = np.stack(self.image_buffer, axis = 0)
+        return state

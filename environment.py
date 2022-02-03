@@ -43,6 +43,7 @@ class Environment:
 
     def step(self, action):
         self.ue_communicator.execute_action_on_unreal_agent(action)
+        #self.ue_communicator.pause_agent()
         collision_happend, torque, steering, laser_distances = self.ue_communicator.get_data(self.num_laser)
 
         print('Laser Distances: {}'.format(laser_distances))
@@ -54,17 +55,18 @@ class Environment:
         distance_smaller_than_threshold_list = []
 
         for i in range(int(self.num_laser / 2)):
-            distance_smaller_than_threshold_list.append(laser_distances[i] < 6)
-            distance_smaller_than_threshold_list.append(laser_distances[self.num_laser -  1 - i] < 6)
+            distance_smaller_than_threshold_list.append(laser_distances[i] < 0.50)
+            distance_smaller_than_threshold_list.append(laser_distances[self.num_laser -  1 - i] < 0.50)
 
         #print(distance_smaller_than_threshold_list)
 
-        if collision_happend or any(distance_smaller_than_threshold_list) or laser_distances[int(self.num_laser / 2)] < 10:
+        if collision_happend or any(distance_smaller_than_threshold_list) or laser_distances[int(self.num_laser / 2)] < 0.50:
             reward = -10
             done = True
             #print('Collision')
         else:
-            reward = ((torque / 20) * np.cos(np.deg2rad(steering)) - 0.36) / 20
+            reward = torque * (np.cos(np.deg2rad(steering)) - 0.77)
+  
 
         print('Reward {}'.format(reward))
 
@@ -94,11 +96,23 @@ class Environment:
 
     def clear_image_buffer(self):
         self.image_buffer.clear()
-    
+
+    def __add_gaussian_noise_to_depth_image(self, depth_image, mean, sigma):
+        gauss = np.random.normal(mean, sigma, depth_image.size)
+        gauss = gauss.reshape(depth_image.shape[0], depth_image.shape[1])
+
+        img_gauss = depth_image + gauss
+        return img_gauss
+
+    def __smoothen_depth_image(self, depth_image, kernel):
+        return np.array(cv2.filter2D(depth_image, -1, kernel), dtype = np.float32)
+
     def get_normalized_predicted_depth_image(self, filename):
         img = np.array(Image.open(filename + '.png').convert('RGB')) / 255.0
-
         depth_image = self.sess.run(self.__tensor_depth, feed_dict={self.__tensor_image: img}).squeeze(axis = (0, 3))
+
+        #depth_image = self.__add_gaussian_noise_to_depth_image(depth_image, 0, 1.0)
+        #depth_image = self.__smoothen_depth_image(depth_image, np.ones((4,4), dtype = np.float32) / 8)
 
         squeezed_depth_image = np.squeeze(depth_image)
         min_depth = squeezed_depth_image.min()

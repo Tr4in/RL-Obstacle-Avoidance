@@ -62,7 +62,7 @@ class DeepQNetwork(nn.Module):
 
 
 
-checkpoint = torch.load('q_model_episode_x.pth')
+checkpoint = torch.load('q_model_episode_1000.pth')
 dummy_input = torch.randn(1, 4, 192, 320, device="cuda")
 model = DeepQNetwork(0.00005, 6)
 model.load_state_dict(checkpoint['main_state_dict'])

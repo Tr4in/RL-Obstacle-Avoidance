@@ -36,7 +36,7 @@ class UECommunicator:
     def pause_agent(self):
         print('Pause')
         pause = str.encode(f"{5}")
-        self.__send(pause, self.__message_to_byte_array(30), self.__message_to_byte_array(0))       
+        self.__send(pause, self.__message_to_byte_array(50), self.__message_to_byte_array(0))       
 
     def request_next_filename(self):
         print('Request next Image-Filename')

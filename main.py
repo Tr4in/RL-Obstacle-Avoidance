@@ -16,15 +16,16 @@ import win32pipe, win32file
 import numpy as np
 import time
 from matplotlib import pyplot as plt
-from experience_replay_buffer import PrioritizedExperienceReplayBuffer
+from prioritized_experience_replay_buffer import PrioritizedExperienceReplayBuffer
+from experience_replay_buffer import ExperienceReplayBuffer
 from ue_communicator import UECommunicator
 
 MODE = 0
-TRAINED_MODEL_PATH = './trained_q_model/q_model_episode_1000.pth'
+TRAINED_MODEL_PATH = './trained_q_model/q_model_episode_50.pth'
 PLOT_REWARDS_PATH = './plots/plot_episode_{}'
 NUM_EPISODES = 1000
 NUM_TEST_EPISODES = 2000
-NUM_TIMESTEPS = 1500
+NUM_TIMESTEPS = 1000
 NUM_ACTIONS = 6
 REPLAY_BUFFER_SIZE = 10000
 BATCH_SIZE = 8
@@ -32,14 +33,16 @@ CONSECUTIVE_IMAGES = 4
 OSERVATION_EPISODES = 10
 UPDATE_TARGET = 50
 SAVE_MODELS = 50
-EPSILON_DEC_TIMESTEPS = 20000
+EPSILON_DEC_TIMESTEPS = 30000
 NUM_LASER = 9
+LAYER_NORM = False
+PER = False
 
 REWARDS = []
 AVERAGE_REWARDS = []
 GAMMA = 0.995
-LEARNING_RATE = 0.00005
-EPSILON = 0.6
+LEARNING_RATE = 0.0001
+EPSILON = 0.7
 EPSILON_END = 0.001
 EPSILON_DEC = (EPSILON - EPSILON_END) / EPSILON_DEC_TIMESTEPS
 IMAGE_SHAPE = (192, 320)
@@ -47,8 +50,6 @@ AVERAGE_NUM = 10
 ALPHA = 0.7
 BETA = 0.5
 BETA_INCREMENT = (1 - BETA) / EPSILON_DEC_TIMESTEPS 
-
-PRIORITIZED_REPLAY_BUFFER = PrioritizedExperienceReplayBuffer(REPLAY_BUFFER_SIZE, BATCH_SIZE, ALPHA, BETA, BETA_INCREMENT)
 
 
 def start_training(start_episode = None):
@@ -73,15 +74,14 @@ def start_training(start_episode = None):
 
             reward, next_observation, done = environment.step(action)
 
-            PRIORITIZED_REPLAY_BUFFER.add_experience((observation, next_observation, action, reward, done))
+            REPLAY_BUFFER.add_experience((observation, next_observation, action, reward, done))
 
             observation = next_observation
             total_reward += reward
             step = step + 1
 
             if episode > OSERVATION_EPISODES: 
-                agent.optimize_q_network(PRIORITIZED_REPLAY_BUFFER, episode)
-                agent.reduce_epsilon()
+                agent.optimize_q_network(REPLAY_BUFFER, episode)
 
             end = time.time()
 
@@ -129,7 +129,7 @@ def load_models_and_last_episode(model_path):
     main_model = DeepQNetwork(LEARNING_RATE, NUM_ACTIONS)
     main_model.load_state_dict(checkpoint['main_state_dict'])
     main_loss = checkpoint['main_loss']
-    main_optimizer = optim.SGD(main_model.parameters(), lr=LEARNING_RATE)
+    main_optimizer = optim.Adam(main_model.parameters(), lr=LEARNING_RATE)
     main_optimizer.load_state_dict(checkpoint['main_optimizer_state_dict'])
     main_model.set_optimizer(main_optimizer)
     main_model.set_loss(main_loss)
@@ -137,7 +137,7 @@ def load_models_and_last_episode(model_path):
     target_model = DeepQNetwork(LEARNING_RATE, NUM_ACTIONS)
     target_model.load_state_dict(checkpoint['target_state_dict'])
     target_loss = checkpoint['target_loss']
-    target_optimizer = optim.SGD(target_model.parameters(), lr=LEARNING_RATE)
+    target_optimizer = optim.Adam(target_model.parameters(), lr=LEARNING_RATE)
     target_optimizer.load_state_dict(checkpoint['target_optimizer_state_dict'])
     target_model.set_optimizer(target_optimizer)
     target_model.set_loss(target_loss)
@@ -190,16 +190,21 @@ try:
     ue_communicator = UECommunicator(pipe)
     environment = Environment(ue_communicator, CONSECUTIVE_IMAGES, NUM_TIMESTEPS, NUM_LASER)
 
+    if PER:
+        REPLAY_BUFFER = PrioritizedExperienceReplayBuffer(REPLAY_BUFFER_SIZE, BATCH_SIZE, ALPHA, BETA, BETA_INCREMENT)
+    else:
+        REPLAY_BUFFER = ExperienceReplayBuffer(REPLAY_BUFFER_SIZE, BATCH_SIZE)
+
     if MODE == 0:
-        agent = Agent(GAMMA, EPSILON, LEARNING_RATE, IMAGE_SHAPE, REPLAY_BUFFER_SIZE, BATCH_SIZE, NUM_ACTIONS, EPSILON_END, EPSILON_DEC)
+        agent = Agent(GAMMA, EPSILON, LEARNING_RATE, IMAGE_SHAPE, REPLAY_BUFFER_SIZE, BATCH_SIZE, NUM_ACTIONS, EPSILON_END, EPSILON_DEC, layer_norm = LAYER_NORM, per = PER)
         start_training()
     elif MODE == 1:
         main_network, target_network, episode = load_models_and_last_episode(TRAINED_MODEL_PATH)
-        agent = Agent(GAMMA, EPSILON - ((episode - OSERVATION_EPISODES) * EPSILON_DEC), LEARNING_RATE, IMAGE_SHAPE, REPLAY_BUFFER_SIZE, BATCH_SIZE, NUM_ACTIONS, EPSILON_END, EPSILON_DEC, target_network, main_network)
+        agent = Agent(GAMMA, EPSILON - ((episode - OSERVATION_EPISODES) * EPSILON_DEC), LEARNING_RATE, IMAGE_SHAPE, REPLAY_BUFFER_SIZE, BATCH_SIZE, NUM_ACTIONS, EPSILON_END, EPSILON_DEC, target_network, main_network, LAYER_NORM, PER)
         start_training(episode)
     elif MODE == 2:
         main_network, target_network, _ = load_models_and_last_episode(TRAINED_MODEL_PATH)
-        agent = Agent(GAMMA, EPSILON, LEARNING_RATE, IMAGE_SHAPE, REPLAY_BUFFER_SIZE, BATCH_SIZE, NUM_ACTIONS, EPSILON_END, EPSILON_DEC, main_network, target_network)
+        agent = Agent(GAMMA, EPSILON, LEARNING_RATE, IMAGE_SHAPE, REPLAY_BUFFER_SIZE, BATCH_SIZE, NUM_ACTIONS, EPSILON_END, EPSILON_DEC, main_network, target_network, LAYER_NORM, PER)
         test_model()
 
     print('finished now')

@@ -19,19 +19,24 @@ from matplotlib import pyplot as plt
 MODEL_SAVE_PATH = './trained_q_model/q_model_episode_{}.pth'
 
 class DeepQNetwork(nn.Module):
-    def __init__(self, lr, n_actions):
+    def __init__(self, lr, n_actions, layer_norm = False, per = False):
         super(DeepQNetwork, self).__init__()
         self.n_actions = n_actions
+        self.layer_norm = layer_norm
         self.conv_layer1 = nn.Conv2d(in_channels = 4, out_channels = 32, kernel_size = 10, stride = 8)
         self.conv_layer2 = nn.Conv2d(in_channels = 32, out_channels = 64, kernel_size = 4, stride = 2)
         self.conv_layer3 = nn.Conv2d(in_channels = 64, out_channels = 64, kernel_size = 3)
 
         self.fully_connected_layer1 = nn.Linear(8192, 1, dtype = torch.float32)
-
         self.fully_connected_layer2 = nn.Linear(8192, self.n_actions, dtype = torch.float32)
         
         self.optimizer = optim.Adam(self.parameters(), lr = lr)
-        self.loss = nn.MSELoss(reduction = 'none')
+
+        if per:
+            self.loss = nn.MSELoss(reduction = 'none')
+        else:
+            self.loss = nn.MSELoss()
+        
         self.device = torch.device('cuda:0')
         self.to(self.device)
 
@@ -39,14 +44,25 @@ class DeepQNetwork(nn.Module):
         return isw * td_error * torch.mean((eval - target) ** 2).to(self.device)
 
     def forward(self, input):
-        input = F.layer_norm(input, input.shape[1:])
+
+        if self.layer_norm:
+            input = F.layer_norm(input, input.shape[1:])
+        
         conv1_output = F.relu(self.conv_layer1(input))
 
         output_conv_layer2 = self.conv_layer2(conv1_output)
-        conv2_output = F.relu(F.layer_norm(output_conv_layer2, output_conv_layer2.shape[1:]))
+
+        if self.layer_norm:
+            conv2_output = F.relu(F.layer_norm(output_conv_layer2, output_conv_layer2.shape[1:]))
+        else:
+            conv2_output = F.relu(output_conv_layer2)
 
         output_conv_layer3 = self.conv_layer3(conv2_output)
-        conv3_output = F.relu(F.layer_norm(output_conv_layer3, output_conv_layer3.shape[1:]))
+
+        if self.layer_norm:
+            conv3_output = F.relu(F.layer_norm(output_conv_layer3, output_conv_layer3.shape[1:]))
+        else:
+            conv3_output = F.relu(output_conv_layer3)
 
         conv3_output = conv3_output.view(-1, 8192)
 
@@ -54,6 +70,7 @@ class DeepQNetwork(nn.Module):
         advantage = self.fully_connected_layer2(conv3_output)
 
         q = v + advantage - torch.mean(advantage)
+
         return q
 
     def get_optimizer(self):
@@ -70,7 +87,7 @@ class DeepQNetwork(nn.Module):
 
 
 class Agent():
-    def __init__(self, gamma, epsilon, alpha, input_dims, experience_memory_size, batch_size, n_actions, eps_end = 0.01, eps_dec = 5e-4, main_network = None, target_network = None):
+    def __init__(self, gamma, epsilon, alpha, input_dims, experience_memory_size, batch_size, n_actions, eps_end = 0.01, eps_dec = 5e-4, main_network = None, target_network = None, layer_norm = False, per = False):
         self.gamma = gamma
         self.epsilon = epsilon
         self.alpha = alpha
@@ -78,12 +95,11 @@ class Agent():
         self.n_actions = n_actions
         self.eps_end = eps_end
         self.eps_dec = eps_dec
-        self.LOSS = deque()
         self.action_space = [i for i in range(n_actions)]
-        self.experience_memory_size = experience_memory_size
+        self.per = per
 
-        self.Q = DeepQNetwork(self.alpha, n_actions) if main_network is None else main_network
-        self.Q_target = DeepQNetwork(self.alpha, n_actions) if target_network is None else target_network
+        self.Q = DeepQNetwork(self.alpha, n_actions, layer_norm, per) if main_network is None else main_network
+        self.Q_target = DeepQNetwork(self.alpha, n_actions, layer_norm, per) if target_network is None else target_network
 
     def get_next_action(self, observation, training):
         if (not training) or np.random.random() > self.epsilon:
@@ -105,7 +121,14 @@ class Agent():
         
     def optimize_q_network(self, experience_replay_buffer, episode):
         print('Learn')
-        batch, sample_indices, importance_sampling_weights = experience_replay_buffer.sample()
+
+        if not experience_replay_buffer.is_possible_to_take_samples():
+            return
+   
+        if self.per:
+            batch, sample_indices, importance_sampling_weights = experience_replay_buffer.sample()
+        else:
+            batch = experience_replay_buffer.sample()
 
         states = torch.tensor(np.array([batch_row[0] for batch_row in batch], dtype = np.float32)).unsqueeze(1).to(self.Q.device)
         next_states = torch.tensor(np.array([batch_row[1] for batch_row in batch], dtype = np.float32)).unsqueeze(1).to(self.Q.device)
@@ -136,21 +159,27 @@ class Agent():
         q_next = q_next.gather(-1, max_action_indices.view(-1,1)).to(self.Q_target.device)
 
         q_target = rewards + (self.gamma * q_next * (1 - dones.long()))
-        
-        td_errors = q_target - q_eval
 
         self.Q.optimizer.zero_grad()
+        
+        if self.per:
+            td_errors = q_target - q_eval
 
-        for index in np.arange(sample_indices.size):
-            elem_index = sample_indices[index]
-            td_error = td_errors[index].item()
-            priority = abs(td_error) + 0.01
-            experience_replay_buffer.update_priority_at(elem_index, priority)
+            for index in np.arange(sample_indices.size):
+                elem_index = sample_indices[index]
+                td_error = td_errors[index].item()
+                priority = abs(td_error) + 0.01
+                experience_replay_buffer.update_priority_at(elem_index, priority)
 
-        loss_output = (torch.FloatTensor(importance_sampling_weights).to(self.Q.device) * self.Q.loss(q_eval, q_target).to(self.Q.device)).mean()
+            loss_output = (torch.FloatTensor(importance_sampling_weights).to(self.Q.device) * self.Q.loss(q_eval, q_target).to(self.Q.device)).mean()
+        else:
+            loss_output = self.Q.loss(q_eval, q_target)
+        
         loss_output.backward()
 
         self.Q.optimizer.step()
+
+        self.reduce_epsilon()
 
     def save_model(self, episode):
         file_name = MODEL_SAVE_PATH
